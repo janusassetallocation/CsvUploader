@@ -1,6 +1,12 @@
 import datetime
 import sys
+import traceback
+import uuid
+from collections import namedtuple
+
 from argh import arg, ArghParser, expects_obj
+
+from csvuploader import HeaderCsv
 from csvuploader.version import VERSION_STRING
 import py.path
 import appdirs
@@ -8,6 +14,7 @@ import yaml
 import time
 import logbook
 from logbook import StreamHandler
+import sqlalchemy as sa
 
 
 class Watcher(object):
@@ -56,6 +63,10 @@ class WatchDirectoryStructure(object):
         self.processing_path = self.base_path.ensure('processing', dir=True)
         self.complete_path = self.base_path.ensure('complete', dir=True)
         self.error_path = self.base_path.ensure('error', dir=True)
+        self.tmp_path = self.base_path.ensure('tmp', dir=True)
+
+
+UploadRequest = namedtuple('UploadRequest', ['path', 'db_name', 'schema_name', 'table_name', 'basename'])
 
 
 def process(path, watch_dir, uploader, *args, **kwargs):
@@ -69,7 +80,11 @@ def process(path, watch_dir, uploader, *args, **kwargs):
     processing_path.dirpath().ensure(dir=True)
     pending_path.move(processing_path)
     try:
-        uploader(processing_path, *args, **kwargs)
+        upload_request = UploadRequest(processing_path, db_name, schema_name, table_name, basename)
+        new_file = uploader(upload_request, *args, **kwargs)
+        if new_file:
+            processing_path.remove()
+            processing_path = new_file
     except Exception as e:
         error_path = watch_dir.error_path.join(db_name, schema_name, table_name, basename)
         error_path.dirpath().ensure(dir=True)
@@ -82,18 +97,50 @@ def process(path, watch_dir, uploader, *args, **kwargs):
     processing_path.move(complete_path)
 
 
-def upload_csv(path, connection_string):
-    logbook.info("Uploading {}".format(path))
+def mk_unique_tempfile(path, ext):
+    uid = "{:%Y-%m-%d-%H-%M-%S}-{}".format(datetime.datetime.now(), uuid.uuid4())
+    return path.join(uid).new(ext=ext)
 
+
+def upload_csv(request, tmp_dir, connection_strings):
+    with request.path.open() as f:
+        h = HeaderCsv.load(f)
+        if h.metadata is None:
+            h.metadata = {}
+        h.metadata.pop('Error', None)
+        h.metadata.pop('StackTrace', None)
+        log = h.metadata.setdefault('log', [])
+        try:
+            connection_string = connection_strings[request.db_name]
+            engine = sa.create_engine(connection_string)
+            if engine.dialect.name == 'sqlite':
+                schema_name = None
+            else:
+                schema_name = request.schema_name
+            insp = sa.inspect(engine)
+            if request.table_name.lower() not in (table_name.lower() for table_name in insp.get_table_names(schema_name)):
+                raise Exception("Unable to upload {}. Table does not exist: {}.{}.{}".format(
+                    request.path, request.db_name, request.schema_name, request.table_name))
+            logbook.info("Uploading {} to {}.{}.{}".format(
+                request.path, request.db_name, request.schema_name, request.table_name))
+            df = h.df
+            df.to_sql(request.table_name, engine, schema=schema_name, if_exists='append')
+            log.append((datetime.datetime.now(), "Upload complete {} to {}.{}.{}".format(
+                request.path, request.db_name, request.schema_name, request.table_name)))
+        except Exception as e:
+            log.append((datetime.datetime.now(), e.message))
+            h.metadata['Error'] = e.message
+            h.metadata['StackTrace'] = traceback.format_exc()
+        finally:
+            tmpfile = mk_unique_tempfile(tmp_dir, 'csv')
+            with tmpfile.open('w') as f_out:
+                h.dump(f_out)
+            return tmpfile
 
 @arg('-D',
      '--directory',
      default='.',
      help='directory to watch for csv files.')
-@arg('--db',
-     '--database',
-     default='default',
-     help='database to load files to')
 @arg('--dbconfigfile',
      nargs='*',
      default=get_default_db_config_file(),
@@ -101,8 +148,6 @@ def upload_csv(path, connection_string):
 @expects_obj
 def watch(args):
     db_connection_strings = get_db_connection_strings(*args.dbconfigfile)
-    connection_string = db_connection_strings[args.db]
-    logbook.info("Connection string: {}".format(connection_string))
     watch_dir = WatchDirectoryStructure(args.directory)
     logbook.info("Watch directory: {}".format(watch_dir.base_path))
 
@@ -113,7 +158,8 @@ def watch(args):
             try:
                 for p in watcher.watch():
                     try:
-                        process(p, watch_dir, upload_csv, connection_string=connection_string)
+                        process(p, watch_dir, upload_csv, tmp_dir=watch_dir.tmp_path,
+                                connection_strings=db_connection_strings)
                     except Exception as e:
                         logbook.error("Unexpected exception processing {}: {}".format(p.strpath, e))
             except Exception as e:

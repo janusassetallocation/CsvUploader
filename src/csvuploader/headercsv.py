@@ -73,6 +73,8 @@ class HeaderCsv(object):
         yaml.dump(self.metadata, stream)
         stream.write(HEADER_END_MAGIC + '\n')
         if self._serialize_df:
+            self._df.to_csv(stream)
+        else:
             self.stream.seek(self.csv_start_pos)
             while True:
                 chunk = self.stream.read(8192)
@@ -80,5 +82,4 @@ class HeaderCsv(object):
                     stream.write(chunk)
                 else:
                     break
-        else:
-            self._df.to_csv(stream)
+
