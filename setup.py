@@ -21,5 +21,5 @@ setup(name='CsvUploader',
       url='',
       package_dir={'': SRC_DIR},
       packages=find_packages(SRC_DIR),
-      requires=['argh', 'appdirs', 'py', 'logbook']
+      requires=['argh', 'appdirs', 'py', 'logbook', 'pandas']
       )
